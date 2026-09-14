@@ -63,6 +63,7 @@ static USERNAME_ID: LazyLock<iced::id::Id> = LazyLock::new(|| iced::id::Id::new(
 )]
 trait Greeter {
     async fn get_user_data(&self) -> Result<String, zbus::Error>;
+    async fn cache_user(&self, name: &str) -> Result<(), zbus::Error>;
 }
 
 async fn user_data_dbus() -> Result<Vec<UserData>, Box<dyn Error>> {
@@ -83,7 +84,7 @@ fn user_data_fallback() -> Vec<UserData> {
     /* unsafe */
     {
         pwd::Passwd::iter()
-            .filter(|user| user_filter.filter(user))
+            .filter(|user| user_filter.filter_local(user))
             .map(UserData::from)
             .collect()
     }
@@ -382,6 +383,7 @@ pub enum Message {
     Heartbeat,
     KeyboardLayout(usize),
     Login,
+    StartSession { cmd: Vec<String>, env: Vec<String> },
     Reconnect,
     Reload(cosmic::Theme),
     RepositionMenu(window::Id, Size),
@@ -1155,6 +1157,12 @@ impl cosmic::Application for App {
             ..Default::default()
         };
 
+        let has_users = !flags.user_datas.is_empty();
+        let entering_name = !has_users;
+        if entering_name {
+            tasks.push(widget::text_input::focus(USERNAME_ID.clone()));
+        }
+
         let app = App {
             common,
             flags,
@@ -1167,7 +1175,7 @@ impl cosmic::Application for App {
             dialog_page_opt: None,
             dropdown_opt: None,
             heartbeat_handle: None,
-            entering_name: false,
+            entering_name,
             accessibility,
             theme_builder: Default::default(),
             randr_list: None,
@@ -1338,10 +1346,12 @@ impl cosmic::Application for App {
             Message::Socket(socket_state) => {
                 self.socket_state = socket_state;
                 if let SocketState::Open = &self.socket_state {
-                    // When socket is opened, send create session
-                    self.send_request(Request::CreateSession {
-                        username: self.selected_username.username.clone(),
-                    });
+                    // Only send create session if a valid username is selected and not entering name
+                    if !self.entering_name && !self.selected_username.username.is_empty() {
+                        self.send_request(Request::CreateSession {
+                            username: self.selected_username.username.clone(),
+                        });
+                    }
                 }
             }
             Message::Reload(new) => {
@@ -1358,6 +1368,7 @@ impl cosmic::Application for App {
                 if self.dropdown_opt == Some(Dropdown::User) {
                     self.dropdown_opt = None;
                 }
+                let was_not_entering = !self.entering_name;
                 self.entering_name = true;
                 self.selected_username = NameIndexPair {
                     data_idx: self
@@ -1367,6 +1378,12 @@ impl cosmic::Application for App {
                         .position(|d| d.name == username),
                     username,
                 };
+                if was_not_entering {
+                    self.common.prompt_opt = None;
+                    if let SocketState::Open = &self.socket_state {
+                        self.send_request(Request::CancelSession);
+                    }
+                }
                 if focus_input {
                     return Task::batch([
                         self.common.dropdown_blur_rects(false),
@@ -1375,10 +1392,14 @@ impl cosmic::Application for App {
                 }
             }
             Message::Username(username) => {
+                if username.is_empty() {
+                    return Task::none();
+                }
                 if self.dropdown_opt == Some(Dropdown::User) {
                     self.dropdown_opt = None;
                 }
                 if self.entering_name || username != self.selected_username.username {
+                    let was_entering = self.entering_name;
                     self.entering_name = false;
                     self.authenticating = false;
                     let data_idx = self
@@ -1386,7 +1407,10 @@ impl cosmic::Application for App {
                         .user_datas
                         .iter()
                         .position(|d| d.name == username);
-                    self.selected_username = NameIndexPair { username, data_idx };
+                    self.selected_username = NameIndexPair {
+                        username: username.clone(),
+                        data_idx,
+                    };
                     self.common.surface_images.clear();
                     if let Some(session) = data_idx.and_then(|i| {
                         self.flags
@@ -1406,7 +1430,11 @@ impl cosmic::Application for App {
                     };
                     if let SocketState::Open = &self.socket_state {
                         self.common.prompt_opt = None;
-                        self.send_request(Request::CancelSession);
+                        if was_entering {
+                            self.send_request(Request::CreateSession { username });
+                        } else {
+                            self.send_request(Request::CancelSession);
+                        }
                     }
                     if let Some(randr_list) = self.randr_list.as_ref() {
                         return Task::batch([
@@ -1419,15 +1447,19 @@ impl cosmic::Application for App {
                 }
             }
             Message::ConfigUpdateUser => {
-                let Some(user_entry) = self.selected_username.data_idx.and_then(|i| {
-                    self.flags
-                        .user_datas
-                        .get(i)
-                        .and_then(|UserData { uid, .. }| {
-                            NonZeroU32::new(*uid)
-                                .map(|uid| self.flags.greeter_config.users.entry(uid))
-                        })
-                }) else {
+                let uid_opt = self
+                    .selected_username
+                    .data_idx
+                    .and_then(|i| self.flags.user_datas.get(i).map(|d| d.uid))
+                    .or_else(|| {
+                        pwd::Passwd::from_name(&self.selected_username.username)
+                            .ok()
+                            .flatten()
+                            .map(|u| u.uid)
+                    })
+                    .and_then(NonZeroU32::new);
+
+                let Some(uid) = uid_opt else {
                     tracing::error!(
                         "Couldn't find user: {:?} {:?}",
                         self.selected_username.username,
@@ -1440,12 +1472,11 @@ impl cosmic::Application for App {
                     tracing::error!(
                         "Failed to update config for {} (UID: {}): no config handler",
                         self.selected_username.username,
-                        user_entry.key()
+                        uid
                     );
                     return Task::none();
                 };
 
-                let uid = *user_entry.key();
                 self.flags.greeter_config.last_user = Some(uid);
                 if let Err(err) = handler.set("last_user", self.flags.greeter_config.last_user) {
                     tracing::error!(
@@ -1454,7 +1485,7 @@ impl cosmic::Application for App {
                         err
                     );
                 }
-                match user_entry {
+                match self.flags.greeter_config.users.entry(uid) {
                     hash_map::Entry::Vacant(entry) => {
                         let last_session = Some(self.selected_session.clone());
                         entry.insert(cosmic_greeter_config::user::UserState { uid, last_session });
@@ -1514,13 +1545,28 @@ impl cosmic::Application for App {
                 self.common.error_opt = None;
                 self.authenticating = false;
 
+                let username = self.selected_username.username.clone();
                 match self.flags.sessions.get(&self.selected_session).cloned() {
                     Some((cmd, env)) => {
-                        self.send_request(Request::StartSession { cmd, env });
-                        return self.update(Message::ConfigUpdateUser);
+                        return cosmic::task::future(async move {
+                            if !username.is_empty() {
+                                if let Ok(connection) = Connection::system().await {
+                                    if let Ok(proxy) = GreeterProxy::new(&connection).await {
+                                        if let Err(e) = proxy.cache_user(&username).await {
+                                            tracing::error!("failed to cache user {}: {:?}", username, e);
+                                        }
+                                    }
+                                }
+                            }
+                            Message::StartSession { cmd, env }
+                        });
                     }
                     None => todo!("session {:?} not found", self.selected_session),
                 }
+            }
+            Message::StartSession { cmd, env } => {
+                self.send_request(Request::StartSession { cmd, env });
+                return self.update(Message::ConfigUpdateUser);
             }
             Message::Error(error) => {
                 self.common.error_opt = Some(error);
