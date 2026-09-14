@@ -83,7 +83,7 @@ fn user_data_fallback() -> Vec<UserData> {
     /* unsafe */
     {
         pwd::Passwd::iter()
-            .filter(|user| user_filter.filter(user))
+            .filter(|user| user_filter.filter_local(user))
             .map(UserData::from)
             .collect()
     }

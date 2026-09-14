@@ -40,13 +40,16 @@ impl UserFilter {
         Self::default()
     }
 
-    pub fn filter(&self, user: &pwd::Passwd) -> bool {
-        if user.uid < self.uid_min || user.uid > self.uid_max {
-            // Skip system accounts
-            return false;
-        }
+    pub fn uid_min(&self) -> u32 {
+        self.uid_min
+    }
 
-        match Path::new(&user.shell).file_name().and_then(|x| x.to_str()) {
+    pub fn uid_max(&self) -> u32 {
+        self.uid_max
+    }
+
+    fn has_valid_shell(shell: &str) -> bool {
+        match Path::new(shell).file_name().and_then(|x| x.to_str()) {
             // Skip shell ending in false
             Some("false") => false,
             // Skip shell ending in nologin
@@ -54,6 +57,57 @@ impl UserFilter {
             _ => true,
         }
     }
+
+    /// Filter for local enumeration (/etc/passwd) using UID_MIN..=UID_MAX bounds
+    pub fn filter_local(&self, user: &pwd::Passwd) -> bool {
+        if user.uid < self.uid_min || user.uid > self.uid_max || user.uid == 65534 || user.uid == u32::MAX {
+            return false;
+        }
+        Self::has_valid_shell(&user.shell)
+    }
+
+    /// Filter for cached / directory service users (allows 32-bit mapped enterprise UIDs)
+    pub fn filter_cached(&self, user: &pwd::Passwd) -> bool {
+        if user.uid < self.uid_min || user.uid == 65534 || user.uid == u32::MAX {
+            return false;
+        }
+        Self::has_valid_shell(&user.shell)
+    }
+
+    pub fn filter(&self, user: &pwd::Passwd) -> bool {
+        self.filter_cached(user)
+    }
+}
+
+#[zbus::proxy(
+    default_service = "org.freedesktop.Accounts",
+    default_path = "/org/freedesktop/Accounts",
+    interface = "org.freedesktop.Accounts"
+)]
+pub trait Accounts {
+    fn list_cached_users(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
+    fn find_user_by_name(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    default_service = "org.freedesktop.Accounts",
+    interface = "org.freedesktop.Accounts.User"
+)]
+pub trait AccountsUser {
+    #[zbus(property)]
+    fn user_name(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn real_name(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn uid(&self) -> zbus::Result<u64>;
+    #[zbus(property)]
+    fn icon_file(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn shell(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn system_account(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn locked(&self) -> zbus::Result<bool>;
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -102,6 +156,10 @@ impl UserData {
     }
 
     pub fn load_config_as_user(&mut self) {
+        self.load_config_as_user_with_icon(None);
+    }
+
+    pub fn load_config_as_user_with_icon(&mut self, icon_file_opt: Option<&str>) {
         self.icon_opt = None;
         self.theme_opt = None;
         self.theme_builder_opt = None;
@@ -109,31 +167,48 @@ impl UserData {
         self.xkb_config_opt = None;
         self.time_applet_config = Default::default();
 
-        //TODO: use accountsservice?
-        //IMPORTANT: This file is owned by root and safe to read (it won't be a link to /etc/shadow for example)
-        // It may not exist if the user uses one of the system icons. In that case, we should read the
-        // information in /var/lib/AccountsService/users, and then read the icon path as the user
-        let icon_path = Path::new("/var/lib/AccountsService/icons").join(&self.name);
-        match fs::OpenOptions::new()
-            .read(true)
-            // Do not follow symlinks
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&icon_path)
-        {
-            Ok(mut icon_file) => {
-                let mut icon_data = Vec::new();
-                match icon_file.read_to_end(&mut icon_data) {
-                    Ok(count) => {
+        // 1. Try reading icon from AccountsService icon_file if provided
+        if let Some(icon_path_str) = icon_file_opt {
+            let icon_path = Path::new(icon_path_str);
+            if icon_path.is_file() {
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(icon_path)
+                {
+                    let mut icon_data = Vec::new();
+                    if let Ok(count) = file.read_to_end(&mut icon_data) {
                         icon_data.truncate(count);
                         self.icon_opt = Some(icon_data);
                     }
-                    Err(err) => {
-                        tracing::error!("failed to read icon data {:?}: {:?}", icon_path, err);
-                    }
                 }
             }
-            Err(err) => {
-                tracing::error!("failed to open icon {:?}: {:?}", icon_path, err);
+        }
+
+        // 2. Fallback to /var/lib/AccountsService/icons/<username>
+        if self.icon_opt.is_none() {
+            let icon_path = Path::new("/var/lib/AccountsService/icons").join(&self.name);
+            match fs::OpenOptions::new()
+                .read(true)
+                // Do not follow symlinks
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&icon_path)
+            {
+                Ok(mut icon_file) => {
+                    let mut icon_data = Vec::new();
+                    match icon_file.read_to_end(&mut icon_data) {
+                        Ok(count) => {
+                            icon_data.truncate(count);
+                            self.icon_opt = Some(icon_data);
+                        }
+                        Err(err) => {
+                            tracing::error!("failed to read icon data {:?}: {:?}", icon_path, err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("failed to open icon {:?}: {:?}", icon_path, err);
+                }
             }
         }
 
@@ -283,3 +358,54 @@ impl From<pwd::Passwd> for UserData {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_user(uid: u32, name: &str, shell: &str) -> pwd::Passwd {
+        pwd::Passwd {
+            name: name.to_string(),
+            passwd: Some("x".to_string()),
+            uid,
+            gid: uid,
+            gecos: Some(name.to_string()),
+            dir: format!("/home/{name}"),
+            shell: shell.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_user_filter() {
+        let filter = UserFilter {
+            uid_min: 1000,
+            uid_max: 60000,
+        };
+
+        // Standard local user
+        let local_user = create_test_user(1000, "alice", "/bin/bash");
+        assert!(filter.filter_local(&local_user));
+        assert!(filter.filter_cached(&local_user));
+
+        // System user (< UID_MIN)
+        let root_user = create_test_user(0, "root", "/bin/bash");
+        assert!(!filter.filter_local(&root_user));
+        assert!(!filter.filter_cached(&root_user));
+
+        // Daemon user with nologin shell
+        let daemon_user = create_test_user(1001, "daemon_acc", "/usr/sbin/nologin");
+        assert!(!filter.filter_local(&daemon_user));
+        assert!(!filter.filter_cached(&daemon_user));
+
+        // Nobody account
+        let nobody_user = create_test_user(65534, "nobody", "/bin/bash");
+        assert!(!filter.filter_local(&nobody_user));
+        assert!(!filter.filter_cached(&nobody_user));
+
+        // Active Directory / SSSD enterprise user with high UID (e.g. 200004)
+        let ad_user = create_test_user(200004, "corp_ad_user", "/bin/bash");
+        assert!(!filter.filter_local(&ad_user)); // exceeds standard local UID_MAX
+        assert!(filter.filter_cached(&ad_user)); // allowed for cached AD users
+    }
+}
+
