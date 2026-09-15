@@ -3,6 +3,7 @@ use cosmic_greeter_daemon::{UserData, UserFilter};
 use std::error::Error;
 use std::ffi::CString;
 use std::future::pending;
+use std::os::unix::fs::MetadataExt;
 use std::{env, io};
 use tracing::metadata::LevelFilter;
 use tracing::warn;
@@ -84,6 +85,28 @@ impl GreeterProxy {
         let mut user_datas = Vec::new();
         for user in users {
             let mut user_data = UserData::from(user.clone());
+
+            // systemd-homed reports an INACTIVE user's home as "/" (the
+            // fallback directory), so run_as_user() below would set HOME=/ and
+            // every cosmic_config helper in load_config_as_user() would try to
+            // create /.config as that user. Root owns /, so each one fails with
+            // EACCES and the daemon logs six errors per such user on every boot
+            // -- for config that is still encrypted and unreadable anyway.
+            //
+            // An active home is owned by the user; the fallback is not. Only load
+            // config when we would be reading the user's own directory.
+            let home_is_users = std::fs::metadata(&user.dir)
+                .map(|meta| meta.uid() == user.uid)
+                .unwrap_or(false);
+            if !home_is_users {
+                tracing::debug!(
+                    "skipping config for {}: {:?} is not their home (locked?)",
+                    user.name,
+                    user.dir
+                );
+                user_datas.push(user_data);
+                continue;
+            }
 
             //IMPORTANT: Assume the identity of the user to ensure we don't read user file data as root
             run_as_user(&user, || user_data.load_config_as_user())

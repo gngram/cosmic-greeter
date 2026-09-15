@@ -96,6 +96,12 @@ impl<M: From<Message> + Send + 'static> Common<M> {
             }
         };
 
+        let fallback_background = std::fs::read("/run/current-system/sw/share/backgrounds/ghaf/1-jake-weirick-kE8n4ODu6fs-unsplash.jpg")
+            .map(widget::image::Handle::from_bytes)
+            .unwrap_or_else(|_| {
+                widget::image::Handle::from_bytes(include_bytes!("../res/background.jpg").to_vec())
+            });
+
         let app = Self {
             wayland_connection: None,
             keyboard_layout: None,
@@ -105,9 +111,7 @@ impl<M: From<Message> + Send + 'static> Common<M> {
             caps_lock: false,
             core,
             error_opt: None,
-            fallback_background: widget::image::Handle::from_bytes(
-                include_bytes!("../res/background.jpg").as_slice(),
-            ),
+            fallback_background,
             layouts_opt,
             network_icon_opt: None,
             on_output_event: None,

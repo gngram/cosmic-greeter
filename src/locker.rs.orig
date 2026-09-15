@@ -708,29 +708,6 @@ impl cosmic::Application for App {
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::None => {}
-            Message::Common(common::Message::SubsurfaceOpened(subsurface_id)) => {
-                let task = self
-                    .common
-                    .update(common::Message::SubsurfaceOpened(subsurface_id));
-                // The subsurface carrying the password entry has only just been
-                // built, and widget operations reach only interfaces that already
-                // exist, so any focus issued before now was discarded. This is the
-                // ordering the resume path hits: the outputs are removed and
-                // recreated while PAM is already past its first prompt, so the
-                // focus-on-first-prompt branch in Message::Prompt cannot fire a
-                // second time and nothing else re-focuses the entry.
-                if matches!(self.state, State::Locked { .. })
-                    && let Some(text_input_id) = self
-                        .common
-                        .surface_names
-                        .get(&subsurface_id)
-                        .and_then(|name| self.common.text_input_ids.get(name))
-                {
-                    let focus = widget::text_input::focus(text_input_id.clone());
-                    return Task::batch([task, focus]);
-                }
-                return task;
-            }
             Message::Common(common_message) => {
                 return self.common.update(common_message);
             }
@@ -887,15 +864,7 @@ impl cosmic::Application for App {
                 }
             }
             Message::SessionLockEvent(session_lock_event) => match session_lock_event {
-                SessionLockEvent::Focused(_, surface_id) => {
-                    // Record which lock surface holds keyboard focus and focus its
-                    // entry. The iced window Focused event derived from the same
-                    // wl_keyboard.enter is resolved through an alias table keyed on
-                    // the wl_surface pointer, which is rebuilt when outputs are
-                    // removed and re-added; this one carries the window::Id
-                    // directly and so survives that.
-                    return self.common.update(common::Message::Focus(surface_id));
-                }
+                SessionLockEvent::Focused(..) => {}
                 SessionLockEvent::Locked => {
                     tracing::info!("session locked");
                     if matches!(self.state, State::Locked { .. }) {
