@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::CString;
 use std::future::pending;
+use std::os::unix::fs::MetadataExt;
 use std::{env, io};
 use tracing::metadata::LevelFilter;
 use tracing::warn;
@@ -22,7 +23,7 @@ fn run_as_user<F: FnOnce() -> T, T>(user: &pwd::Passwd, f: F) -> Result<T, io::E
     let root_home_opt = env::var_os("HOME");
 
     // Save root groups
-    let root_groups = getgroups().expect("failed to get root groups");
+    let root_groups = getgroups().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
     // Switch to user HOME
     unsafe {
@@ -30,20 +31,24 @@ fn run_as_user<F: FnOnce() -> T, T>(user: &pwd::Passwd, f: F) -> Result<T, io::E
     }
 
     // Switch to user identity
-    {
-        let name_c = CString::new(&*user.name).expect("invalid username");
-        initgroups(&name_c, Gid::from_raw(user.gid))
-            .expect("failed to set user supplementary groups");
+    if let Ok(name_c) = CString::new(&*user.name) {
+        // Ignore initgroups failure since AD / domain users might not have local group records
+        let _ = initgroups(&name_c, Gid::from_raw(user.gid));
     }
-    setegid(Gid::from_raw(user.gid)).expect("failed to set user gid");
-    seteuid(Uid::from_raw(user.uid)).expect("failed to set user uid");
+    if let Err(e) = setegid(Gid::from_raw(user.gid)) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()));
+    }
+    if let Err(e) = seteuid(Uid::from_raw(user.uid)) {
+        let _ = setegid(Gid::from_raw(0));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()));
+    }
 
     let t = f();
 
     // Restore root identity
-    seteuid(Uid::from_raw(0)).expect("failed to restore root uid");
-    setegid(Gid::from_raw(0)).expect("failed to restore root gid");
-    setgroups(&root_groups).expect("failed to restore root supplementary groups");
+    let _ = seteuid(Uid::from_raw(0));
+    let _ = setegid(Gid::from_raw(0));
+    let _ = setgroups(&root_groups);
 
     // Restore root HOME
     match root_home_opt {
@@ -76,8 +81,8 @@ impl GreeterProxy {
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> Result<String, GreeterError> {
         let user_filter = UserFilter::new();
-        // Map of uid -> (pwd::Passwd, Option<real_name>, Option<icon_file>)
-        let mut user_map: BTreeMap<u32, (pwd::Passwd, Option<String>, Option<String>)> =
+        // Map of username -> (pwd::Passwd, Option<real_name>, Option<icon_file>)
+        let mut user_map: BTreeMap<String, (pwd::Passwd, Option<String>, Option<String>)> =
             BTreeMap::new();
 
         // 1. Query AccountsService for cached users (includes AD / SSSD / domain users)
@@ -117,7 +122,7 @@ impl GreeterProxy {
 
                             if let Some(user) = passwd_opt {
                                 if user_filter.filter_cached(&user) {
-                                    user_map.insert(user.uid, (user, real_name, icon_file));
+                                    user_map.insert(user.name.clone(), (user, real_name, icon_file));
                                 }
                             }
                         }
@@ -134,7 +139,7 @@ impl GreeterProxy {
 
         for user in local_users {
             user_map
-                .entry(user.uid)
+                .entry(user.name.clone())
                 .or_insert_with(|| (user, None, None));
         }
 
@@ -145,11 +150,27 @@ impl GreeterProxy {
                 user_data.full_name = real_name;
             }
 
+            // An active home is owned by the user; the fallback is not. Only load
+            // config when we would be reading the user's own directory.
+            let home_is_users = std::fs::metadata(&user.dir)
+                .map(|meta| meta.uid() == user.uid)
+                .unwrap_or(false);
+            if !home_is_users {
+                tracing::debug!(
+                    "skipping config for {}: {:?} is not their home (locked or uncreated?)",
+                    user.name,
+                    user.dir
+                );
+                user_datas.push(user_data);
+                continue;
+            }
+
             // IMPORTANT: Assume identity of user to ensure we don't read user file data as root
-            run_as_user(&user, || {
+            if let Err(err) = run_as_user(&user, || {
                 user_data.load_config_as_user_with_icon(icon_file_opt.as_deref())
-            })
-            .map_err(|err| GreeterError::RunAsUser(err.to_string()))?;
+            }) {
+                tracing::warn!("failed to run as user {}: {}", user.name, err);
+            }
 
             user_datas.push(user_data);
         }
